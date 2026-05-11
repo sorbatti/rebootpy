@@ -291,6 +291,8 @@ class Presence:
         raw: dict
     ) -> None:
         self.client = client
+        self.raw = raw
+
         from_id = raw['accountId']
 
         self.friend = self.client.get_friend(from_id)
