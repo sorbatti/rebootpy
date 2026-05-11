@@ -230,6 +230,8 @@ class Presence:
     ----------
     client: :class:`Client`
         The client.
+    raw: :class:`dict`
+        The raw data.
     away: :class:`AwayStatus`
         The users away status.
     friend: :class:`Friend`
@@ -278,7 +280,7 @@ class Presence:
         The friend's current experience, playlist or island code.
     """
 
-    __slots__ = ('client', 'away', 'friend', 'platform',
+    __slots__ = ('client', 'raw', 'away', 'friend', 'platform',
                  'received_at', 'status', 'joinable',
                  'session_id', 'has_properties', 'homebase_rating', 'lfg',
                  'sub_game', 'in_unjoinable_match', 'playlist', 'party_size',
