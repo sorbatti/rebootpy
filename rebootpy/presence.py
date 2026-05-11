@@ -304,7 +304,7 @@ class Presence:
 
         data = (raw.get('perNs') or [{}])[0]
 
-        self.status = data.get('status')
+        self.status = data.get('activity', {}).get('value')
 
         raw_properties = {
             key: (
