@@ -348,6 +348,8 @@ class Presence:
         party_size = raw_properties.get('FortPartySize') or raw_properties.get('Event_PartySize')
         if party_size is not None:
             self.party_size = int(party_size.replace('i', '').replace('s', ''))
+        else:
+            self.party_size = None
 
         self.max_party_size = raw_properties.get('Event_PartyMaxSize')
         if self.max_party_size is not None:
