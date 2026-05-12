@@ -1762,7 +1762,7 @@ class HTTPClient:
                                  ) -> Any:
         if not self.client.party:
             payload = {
-                "status": "online",
+                "status": self.client.away.value,
                 "props": {
                     "EOS_Platform": "WIN",
                     "EOS_IntegratedPlatform": "EGS",
@@ -1785,7 +1785,7 @@ class HTTPClient:
             )
 
             payload = {
-                "status": "online",
+                "status": self.client.away.value,
                 "activity": {
                     "value": formatted_status
                 },
