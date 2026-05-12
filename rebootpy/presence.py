@@ -345,9 +345,9 @@ class Presence:
         if players_alive is not None:
             players_alive = int(players_alive)
 
-        self.party_size = raw_properties.get('Event_PartySize')
-        if self.party_size is not None:
-            self.party_size = int(self.party_size)
+        party_size = raw_properties.get('FortPartySize')
+        if party_size is not None:
+            self.party_size = int(party_size.removeprefix("i"))
 
         self.max_party_size = raw_properties.get('Event_PartyMaxSize')
         if self.max_party_size is not None:
