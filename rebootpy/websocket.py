@@ -148,11 +148,23 @@ class WebsocketClient:
             request_class=WebsocketRequest
         )
 
-    async def send_presence(self, connection_id: str) -> None:
-        await self.client.http.chat_send_presence(
-            connection_id=connection_id,
-            auth="EAS_ACCESS_TOKEN"
-        )
+    async def send_presence(self, connection_id: str, retry: bool = True) -> None:
+        try:
+            await self.client.http.chat_send_presence(
+                connection_id=connection_id,
+                auth="EAS_ACCESS_TOKEN"
+            )
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404 and retry:
+                log.warning(
+                    f'Received 404 for presence endpoint (connection_id: {connection_id}). '
+                    'Restarting websocket and retrying.'
+                )
+                await self.restart()
+                await asyncio.sleep(1)
+                await self.send_presence(connection_id=connection_id, retry=False)
+            else:
+                raise
 
     async def send_heartbeat(self, delay: int) -> None:
         while not self.websocket.closed:
