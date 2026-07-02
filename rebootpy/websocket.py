@@ -51,85 +51,6 @@ def decode_message_body(body: str) -> str:
         return body
 
 
-class WebsocketRequest(aiohttp.client_reqrep.ClientRequest):
-    async def send(self,
-                   conn: "aiohttp.connector.Connection"
-                   ) -> "aiohttp.ClientResponse":
-        if self.method == hdrs.METH_CONNECT:
-            connect_host = self.url.raw_host
-            assert connect_host is not None
-            if helpers.is_ipv6_address(connect_host):
-                connect_host = f"[{connect_host}]"
-            path = f"{connect_host}:{self.url.port}"
-        elif self.proxy and not self.is_ssl():
-            path = str(self.url)
-        else:
-            path = self.url.raw_path
-            if self.url.raw_query_string:
-                path += "?" + self.url.raw_query_string
-
-        protocol = conn.protocol
-        assert protocol is not None
-        writer = StreamWriter(
-            protocol,
-            self.loop,
-            on_chunk_sent=functools.partial(
-                self._on_chunk_request_sent, self.method, self.url
-            ),
-            on_headers_sent=functools.partial(
-                self._on_headers_request_sent, self.method, self.url
-            ),
-        )
-
-        if self.compress:
-            writer.enable_compression(self.compress)
-
-        if self.chunked is not None:
-            writer.enable_chunking()
-
-        if (
-            self.method in self.POST_METHODS
-            and hdrs.CONTENT_TYPE not in self.skip_auto_headers
-            and hdrs.CONTENT_TYPE not in self.headers
-        ):
-            self.headers[hdrs.CONTENT_TYPE] = "application/octet-stream"
-
-        connection = self.headers.get(hdrs.CONNECTION)
-        if not connection:
-            if self.keep_alive():
-                if self.version == HttpVersion10:
-                    connection = "keep-alive"
-            else:
-                if self.version == HttpVersion11:
-                    connection = "close"
-
-        if connection is not None:
-            self.headers[hdrs.CONNECTION] = connection
-
-        status_line = "{0} {1} HTTP/{2[0]}.{2[1]}".format(
-            self.method, path, self.version
-        ) if "/stomp" not in path else "GET https://connect.epicgames.dev/ " \
-                                       "HTTP/1.1"
-        await writer.write_headers(status_line, self.headers)
-
-        self._writer = self.loop.create_task(self.write_bytes(writer, conn, None))
-
-        response_class = self.response_class
-        assert response_class is not None
-        self.response = response_class(
-            self.method,
-            self.original_url,
-            writer=self._writer,
-            continue100=self._continue,
-            timer=self._timer,
-            request_info=self.request_info,
-            traces=self._traces,
-            loop=self.loop,
-            session=self._session,
-        )
-        return self.response
-
-
 class WebsocketClient:
     def __init__(self, client) -> None:
         self.client = client
@@ -143,10 +64,7 @@ class WebsocketClient:
         self.connection_id = None
 
     async def set_session(self) -> None:
-        self.wss_session = aiohttp.ClientSession(
-            skip_auto_headers=["Accept", "Accept-Encoding", "User-Agent"],
-            request_class=WebsocketRequest
-        )
+        self.wss_session = aiohttp.ClientSession()
 
     async def send_presence(self, connection_id: str, retry: bool = True) -> None:
         try:
@@ -305,6 +223,7 @@ class WebsocketClient:
             await self.restart()
 
     async def connect_to_websocket(self) -> None:
+        print('connecting to ws')
         headers = {
             'Authorization': f'Bearer {self.client.auth.eas_access_token}',
             'Epic-Connect-Protocol': 'stomp',
@@ -312,7 +231,7 @@ class WebsocketClient:
             'Epic-Connect-Device-Id': " ",
         }
         async with self.wss_session.ws_connect(
-            "wss://connect.epicgames.dev/stomp",
+            "wss://connect.epicgames.dev/",
             protocols=['stomp'],
             headers=headers
         ) as websocket:
