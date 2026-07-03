@@ -3746,22 +3746,32 @@ class PartyBase:
                 '820665c477184929aa5d0e1f56902cfd'
             )
         """
-        island = max(
-            (
-                json.loads(m.meta.schema['Default:MatchmakingInfo_j'])
-                ['MatchmakingInfo']['islandSelection'] for m in self.members
-            ),
-            key=lambda data: data['timestamp']
-        )
+        members = self.members
+        if not members:
+            return ('', '')
+
+        try:
+            island = max(
+                (
+                    json.loads(m.meta.schema['Default:MatchmakingInfo_j'])
+                    ['MatchmakingInfo']['islandSelection'] for m in members
+                ),
+                key=lambda data: data['timestamp']
+            )
+        except (KeyError, ValueError, json.JSONDecodeError):
+            return ('', '')
 
         playlist_id = json.loads(island['island'])['LinkId']
 
         session_id = next(
-            json.loads(
-                json.loads(member.meta.schema['Default:MatchmakingInfo_j'])
-                ['MatchmakingInfo']['currentIsland']['island']
-            )['Session']['iD']
-            for member in self.members
+            (
+                json.loads(
+                    json.loads(member.meta.schema['Default:MatchmakingInfo_j'])
+                    ['MatchmakingInfo']['currentIsland']['island']
+                )['Session']['iD']
+                for member in members
+            ),
+            '',
         )
 
         return (playlist_id, session_id)
