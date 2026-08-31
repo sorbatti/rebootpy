@@ -1591,9 +1591,8 @@ class HTTPClient:
                             'dn': self.client.user.display_name,
                             'plat': self.client.platform.value,
                             'data': json.dumps({
-                                'CrossplayPreference': '1',
+                                'CrossplayPreference_i': '1',
                                 'SubGame_u': '1',
-                                'TargetUserId_s': user_id
                             })
                         }
                     ]
