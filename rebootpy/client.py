@@ -50,7 +50,7 @@ from .friend import Friend, IncomingPendingFriend, OutgoingPendingFriend
 from .enums import (Platform, Region, UserSearchPlatform, AwayStatus,
                     StatsCollectionType, Season, Country)
 from .party import (DefaultPartyConfig, DefaultPartyMemberConfig, ClientParty,
-                    Party)
+                    Party, ReceivedPartyInvitation, PartyJoinRequest)
 from .stats import StatsV2, StatsCollection, _StatsBase, CompetitiveRank
 from .store import Store
 from .creative import CreativeIsland
@@ -60,7 +60,7 @@ from .presence import Presence
 from .auth import Auth, RefreshTokenAuth
 from .avatar import Avatar
 from .typedefs import MaybeCoro, DatetimeOrTimestamp, StrOrInt
-from .utils import LockEvent, MaybeLock, from_iso, is_display_name
+from .utils import LockEvent, MaybeLock, from_iso, to_iso, is_display_name
 
 log = logging.getLogger(__name__)
 
@@ -2898,6 +2898,24 @@ class Client(BasicClient):
         self._join_confirmation = False
         self._refresh_times = []
 
+        self.disable_epic_party_service = kwargs.get(
+            'disable_epic_party_service', False
+        )
+        self.fetch_net_cl_on_ready = kwargs.get('fetch_net_cl_on_ready', True)
+        self.epic_party_poll_interval = kwargs.get(
+            'epic_party_poll_interval', 2.0
+        )
+
+        self._epic_party_poll_task = None
+        self._epic_party_poll_in_flight = False
+        self._epic_party_seen_invites = set()
+        self._epic_party_handled_invites = {}
+        self._epic_party_revision = 0
+        self._epic_party_recreate_in_flight = False
+        self._epic_party_last_recreate_at = 0.0
+
+        self._reconnecting_to_party = False
+
         self.setup_internal()
 
     async def _async_init(self) -> None:
@@ -3059,6 +3077,7 @@ class Client(BasicClient):
         self._check_party_confirmation()
 
     async def internal_auth_refresh_handler(self):
+        self._reconnecting_to_party = True
         try:
             log.debug('Refreshing xmpp session')
             await self.xmpp._close()
@@ -3067,12 +3086,15 @@ class Client(BasicClient):
             log.debug('Refreshing websocket session')
             await self.websocket.close()
             await self.websocket.run()
+            await self.rebind_epic_party_connection()
 
             await asyncio.sleep(2)
 
             await self._reconnect_to_party()
         except AttributeError:
             pass
+        finally:
+            self._reconnecting_to_party = False
 
     async def _start(self, dispatch_ready: bool = True) -> None:
         if self._first_start:
@@ -3105,8 +3127,12 @@ class Client(BasicClient):
         log.debug('Connected to websocket')
         log.debug('Registered public key')
 
+        await self.fetch_net_cl(priority=priority)
+
         await self.initialize_party(priority=priority)
         log.debug('Party created')
+
+        self.start_epic_party_service()
 
     def _clear_caches(self) -> None:
         super()._clear_caches()
@@ -3121,6 +3147,8 @@ class Client(BasicClient):
                      dispatch_close: bool = True,
                      priority: int = 0) -> None:
         self._closing = True
+
+        self.stop_epic_party_service()
 
         if self.leave_party_at_shutdown:
             try:
@@ -3183,6 +3211,625 @@ class Client(BasicClient):
         for pending in self._pending_friends.values():
             if pending not in pre_pending:
                 self.dispatch_event('friend_request', pending)
+
+    ###################################
+    #           Epic Party            #
+    ###################################
+
+    async def fetch_net_cl(self, priority: int = 0) -> None:
+        existing_build = (self.party_build_id or '').split(':')[-1]
+        if existing_build:
+            try:
+                parsed = int(existing_build)
+            except ValueError:
+                parsed = 0
+
+            if parsed > 0:
+                self.net_cl = existing_build
+                return
+
+        live = None
+        if self.fetch_net_cl_on_ready:
+            try:
+                sessions = await self.http.matchmaking_request(
+                    priority=priority
+                )
+                live = int(sessions[0]['buildUniqueId'])
+            except (HTTPException, IndexError, KeyError, TypeError,
+                    ValueError):
+                live = None
+
+            if live is not None and live <= 0:
+                live = None
+
+        if live:
+            self.net_cl = str(live)
+
+        self.party_build_id = '1:{0.party_version}:{0.net_cl}'.format(self)
+        log.debug(
+            'Resolved party build id to %s%s',
+            self.party_build_id,
+            '' if live else ' (fallback)'
+        )
+
+    def _get_private_connection_id(self, connection_id: str) -> str:
+        if self.websocket.private_connection_id:
+            return self.websocket.private_connection_id
+        if '#sub-eas-private-' in connection_id:
+            return connection_id
+        if '#sub-eas-' in connection_id:
+            return connection_id.replace('#sub-eas-', '#sub-eas-private-')
+        return connection_id
+
+    def _get_public_connection_id(self, connection_id: str) -> str:
+        if self.websocket.public_connection_id:
+            return self.websocket.public_connection_id
+        if '#sub-eas-private-' in connection_id:
+            return connection_id.replace('#sub-eas-private-', '#sub-eas-')
+        return connection_id
+
+    async def rebind_epic_party_connection(self) -> None:
+        if self.disable_epic_party_service:
+            return
+
+        epic_party_id = self.party.epic_party_id if self.party else None
+        if not epic_party_id:
+            return
+
+        connection_id = self.websocket.connection_id
+        if not connection_id:
+            return
+
+        public_connection_id = self._get_public_connection_id(
+            connection_id
+        )
+
+        try:
+            await self.http.epic_party_connect(
+                epic_party_id, public_connection_id
+            )
+            log.debug(
+                'rebound connection after STOMP reconnect'
+            )
+        except HTTPException as e:
+            log.debug(f'connection rebind failed: {e}')
+            await self.recreate_party_after_epic_disband(
+                'connection-rebind-failed', epic_party_id
+            )
+
+    async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
+        connection_id = self.websocket.connection_id
+        if not connection_id:
+            return
+
+        public_connection_id = self.websocket.public_connection_id or connection_id  # noqa
+        private_connection_id = self.websocket.private_connection_id or connection_id  # noqa
+
+        party_size = self.party.member_count if self.party else 1
+        if raw_status and raw_status.get('Status'):
+            status_value = raw_status['Status']
+        elif self.party:
+            status_value = self.status.format(
+                party_size=self.party.member_count,
+                party_max_size=self.party.max_size,
+                current_playlist=self.current_status_playlist,
+            )
+        else:
+            status_value = 'In Lobby'
+
+        gameplay_stats_json = json.dumps({
+            'state': '',
+            'playlist': 'None',
+            'numKills': 0,
+            'bFellToDeath': False,
+        })
+        social_status_json = json.dumps({'attendingSocialEventIds': []})
+
+        payload = {
+            'status': 'online',
+            'activity': {'value': status_value},
+            'props': {
+                'FortBasicInfo': f'm{json.dumps({"homeBaseRating": 0})}',
+                'FortLFG': 'i0',
+                'FortPartySize': f'i{party_size}',
+                'FortSubGame': 'i1',
+                'IslandCode': 'sexperience_br',
+                'IsInZone': 'bfalse',
+                'FortGameplayStats': f'm{gameplay_stats_json}',
+                'SocialStatus': f'm{social_status_json}',
+                'InUnjoinableMatch': 'bfalse',
+                'party.joininfodata.286331153': 'm{"bIsPrivate":true}',
+                'EOS_Platform': self.platform.value,
+                'EOS_IntegratedPlatform': 'EGS',
+                'EOS_OnlinePlatformType': '100',
+                'EOS_ProductVersion': self.build,
+                'EOS_ProductName': 'Fortnite',
+                'EOS_Session': json.dumps({'version': 3}),
+                'EOS_Lobby': json.dumps({'version': 3}),
+            },
+            'conn': {'props': {}},
+        }
+
+        epic_party_id = self.party.epic_party_id if self.party else None
+        internal_presence = {
+            'status': 'online',
+            'activity': {},
+            'conn': {'props': {}},
+        }
+        if epic_party_id:
+            is_private = self.party.config['privacy']['partyType'] == 'Private'  # noqa
+            internal_presence['party'] = {
+                'type': 'INVITE_ONLY' if is_private else 'OPEN',
+                'id': epic_party_id,
+                'clientJoinable': True,
+                'memberCount': self.party.member_count,
+                'timestamp': to_iso(
+                    datetime.datetime.now(datetime.timezone.utc)
+                ),
+            }
+
+        try:
+            await self.http.eos_presence_send(connection_id, payload)
+        except HTTPException as e:
+            log.debug(f'Failed to send presence: {e}')
+
+        if public_connection_id != connection_id:
+            try:
+                await self.http.eos_presence_send(
+                    public_connection_id, payload
+                )
+                log.debug(
+                    f'Uploaded public presence - {payload}'
+                )
+            except HTTPException as e:
+                log.debug(
+                    f'Failed to send public presence: {e}'
+                )
+
+        if private_connection_id != connection_id:
+            try:
+                await self.http.eos_presence_send(
+                    private_connection_id, internal_presence, internal=True
+                )
+                log.debug(
+                    'Uploaded internal presence - '
+                    f'{internal_presence}'
+                )
+            except HTTPException as e:
+                log.debug(
+                    f'Failed to send internal presence: {e}'
+                )
+
+    async def _create_epic_party(self, party_config: dict,
+                                priority: int = 0) -> Tuple[dict, str]:
+        connection_id = self.websocket.connection_id
+        if not connection_id:
+            raise RuntimeError(
+                'No STOMP connection id available for Epic party creation.'
+            )
+
+        private_connection_id = self._get_private_connection_id(
+            connection_id
+        )
+        public_connection_id = self._get_public_connection_id(
+            connection_id
+        )
+
+        await self.send_eos_presence()
+
+        try:
+            epic_user = await self.http.epic_party_get_user(priority=priority)
+        except HTTPException:
+            epic_user = None
+
+        current = (epic_user or {}).get('current') or None
+        if current and current.get('id'):
+            try:
+                await self.http.epic_party_remove_member(
+                    current['id'], self.user.id, priority=priority
+                )
+            except HTTPException:
+                pass
+
+        try:
+            legacy_user = await self.http.party_lookup_user(
+                self.user.id, priority=priority
+            )
+        except HTTPException:
+            legacy_user = None
+
+        if legacy_user and legacy_user.get('current'):
+            try:
+                await self.http.party_leave(
+                    legacy_user['current'][0]['id'], priority=priority
+                )
+            except HTTPException:
+                pass
+
+        epic_party = await self.http.epic_party_create(
+            private_connection_id, priority=priority
+        )
+
+        await self.http.epic_party_set_config(
+            epic_party['id'],
+            'OPEN',
+            revision=epic_party.get('revision', 0),
+            priority=priority,
+        )
+
+        await self.http.epic_party_connect(
+            epic_party['id'], public_connection_id, priority=priority
+        )
+
+        build_id = (self.party_build_id or '').split(':')[-1]
+        lobby_id = f"{epic_party['id']}-{build_id}-default"
+
+        lobby_config = {
+            'discoverability': 'ALL',
+            'join_confirmation': party_config.get('join_confirmation', False),
+            'joinability': 'OPEN',
+            'max_size': party_config.get('max_size', 16),
+        }
+        lobby = await self.http.party_lobby_join(
+            epic_party['id'], lobby_id, lobby_config, priority=priority
+        )
+
+        return lobby, epic_party['id']
+
+    async def join_party(self, epic_party_id: str) -> ClientParty:
+        """|coro|
+
+        Joins a party by the party id.
+
+        Parameters
+        ----------
+        epic_party_id: :class:`str`
+            The party id to join.
+        """
+        connection_id = self.websocket.connection_id
+        if not connection_id:
+            raise RuntimeError(
+                'No STOMP connection id available to join an Epic party.'
+            )
+
+        private_connection_id = self._get_private_connection_id(
+            connection_id
+        )
+        public_connection_id = self._get_public_connection_id(
+            connection_id
+        )
+
+        await self._join_party_lock.acquire()
+        try:
+            if self.party is not None:
+                try:
+                    await self.http.party_leave(
+                        self.party.id, priority=0
+                    )
+                except HTTPException:
+                    pass
+                self.party = None
+
+            try:
+                epic_user = await self.http.epic_party_get_user()
+            except HTTPException:
+                epic_user = None
+
+            current = (epic_user or {}).get('current') or None
+            if current and current.get('id') and current['id'] != epic_party_id:  # noqa
+                try:
+                    await self.http.epic_party_remove_member(
+                        current['id'], self.user.id
+                    )
+                except HTTPException:
+                    pass
+
+            await self.http.epic_party_join(
+                epic_party_id, private_connection_id
+            )
+            await self.http.epic_party_connect(
+                epic_party_id, public_connection_id
+            )
+
+            build_id = (self.party_build_id or '').split(':')[-1]
+            lobby_id = f'{epic_party_id}-{build_id}-default'
+
+            lobby_config = {
+                'discoverability': 'ALL',
+                'join_confirmation': False,
+                'joinability': 'OPEN',
+                'max_size': 16,
+            }
+            lobby = await self.http.party_lobby_join(
+                epic_party_id, lobby_id, lobby_config
+            )
+
+            party = self.construct_party(lobby)
+            party.epic_party_id = epic_party_id
+            await party._update_members(members=lobby['members'])
+            self.party = party
+        except Exception:
+            self._join_party_lock.release()
+            await self._create_party(acquire=False)
+            raise
+        else:
+            self._join_party_lock.release()
+
+        return party
+
+    async def recreate_party_after_epic_disband(
+        self,
+        source: str,
+        disbanded_party_id: Optional[str] = None,
+    ) -> None:
+        if self.disable_epic_party_service:
+            return
+        if (
+            self._join_party_lock.locked()
+            or self._epic_party_recreate_in_flight
+            or self._reconnecting_to_party
+        ):
+            return
+
+        current_epic_party_id = self.party.epic_party_id if self.party else None  # noqa
+        if (disbanded_party_id and current_epic_party_id
+                and disbanded_party_id != current_epic_party_id):
+            return
+
+        if time.time() - self._epic_party_last_recreate_at < 3:
+            return
+
+        self._epic_party_recreate_in_flight = True
+        self._epic_party_last_recreate_at = time.time()
+        try:
+            log.debug(f'recreating party (source={source})')
+            if self.party is not None:
+                self.party.epic_party_id = None
+
+            await self._create_party()
+            self.dispatch_event('party_recreated')
+        except Exception as e:
+            log.debug(f'recreate failed: {e}')
+        finally:
+            self._epic_party_recreate_in_flight = False
+
+    def start_epic_party_service(self) -> None:
+        if self.disable_epic_party_service:
+            return
+        if self._epic_party_poll_task is not None:
+            return
+        if self.auth.eas_access_token is None:
+            return
+
+        self._epic_party_poll_task = self.loop.create_task(
+            self._epic_party_poll_loop()
+        )
+
+    def stop_epic_party_service(self) -> None:
+        if self._epic_party_poll_task is not None:
+            self._epic_party_poll_task.cancel()
+            self._epic_party_poll_task = None
+
+    async def _epic_party_poll_loop(self) -> None:
+        while True:
+            try:
+                await self._epic_party_poll()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.debug(f'poll failed: {e}')
+
+            try:
+                await asyncio.sleep(self.epic_party_poll_interval)
+            except asyncio.CancelledError:
+                raise
+
+    async def epic_party_keep_alive(self) -> None:
+        epic_party_id = self.party.epic_party_id if self.party else None
+        if not epic_party_id:
+            return
+
+        try:
+            await self.http.epic_party_keep_alive(epic_party_id)
+        except HTTPException as e:
+            log.debug(f'keep-alive failed: {e}')
+
+    async def _epic_party_poll(self) -> None:
+        if self._epic_party_poll_in_flight:
+            return
+        if not self.is_ready():
+            return
+        if self.disable_epic_party_service:
+            return
+        if self._reconnecting_to_party:
+            return
+
+        self._epic_party_poll_in_flight = True
+        try:
+            await self.epic_party_keep_alive()
+
+            try:
+                data = await self.http.epic_party_get_user()
+            except HTTPException as e:
+                log.debug(f'invite poll failed: {e}')
+                return
+
+            invites = data.get('invites') or []
+            join_requests = data.get('join_requests') or []
+            current = data.get('current') or None
+            local_epic_party_id = self.party.epic_party_id if self.party else None  # noqa
+
+            if current and current.get('revision') is not None:
+                try:
+                    self._epic_party_revision = int(current['revision'])
+                except (TypeError, ValueError):
+                    pass
+
+            if not current and local_epic_party_id:
+                await self.recreate_party_after_epic_disband(
+                    'poll-stale-eos', local_epic_party_id
+                )
+
+            if self._event_has_destination('party_invite'):
+                for invite in invites:
+                    key = '{0}:{1}:{2}'.format(
+                        invite.get('sent_by'),
+                        invite.get('party_id'),
+                        invite.get('sent_at'),
+                    )
+                    if key in self._epic_party_seen_invites:
+                        continue
+                    self._epic_party_seen_invites.add(key)
+                    await self._emit_epic_party_invite(invite)
+
+            for request in join_requests:
+                await self._handle_epic_join_request(request, 'poll')
+
+            if len(self._epic_party_seen_invites) > 200:
+                self._epic_party_seen_invites = set(
+                    list(self._epic_party_seen_invites)[-100:]
+                )
+        finally:
+            self._epic_party_poll_in_flight = False
+
+    async def set_epic_party_joinability(self, epic_party_id: str,
+                                        joinability: str,
+                                        retried: bool = False) -> None:
+        try:
+            await self.http.epic_party_set_config(
+                epic_party_id, joinability, revision=self._epic_party_revision
+            )
+            self._epic_party_revision += 1
+        except HTTPException as e:
+            code = getattr(e, 'message_code', '') or ''
+            if not retried and code.endswith('stale_revision'):
+                return await self.set_epic_party_joinability(
+                    epic_party_id, joinability, retried=True
+                )
+            log.debug(f'joinability {joinability} failed: {e}')
+
+    async def _emit_epic_party_invite(self, invite: dict) -> None:
+        sender_id = invite.get('sent_by')
+        if self.get_friend(sender_id) is None:
+            try:
+                await self.wait_for(
+                    'friend_add',
+                    check=lambda f: f.id == sender_id,
+                    timeout=3,
+                )
+            except asyncio.TimeoutError:
+                return
+
+        build_id = (self.party_build_id or '').split(':')[-1]
+        party_id = invite.get('party_id')
+        lobby_id = f'{party_id}-{build_id}-default' if build_id else party_id
+        sent_at = invite.get('sent_at') or to_iso(
+            datetime.datetime.now(datetime.timezone.utc)
+        )
+
+        stub = {
+            'id': lobby_id,
+            'created_at': sent_at,
+            'updated_at': invite.get('updated_at', sent_at),
+            'config': {
+                'type': 'DEFAULT',
+                'joinability': 'OPEN',
+                'discoverability': 'ALL',
+                'sub_type': 'default',
+                'max_size': 16,
+                'invite_ttl': 3600,
+                'join_confirmation': False,
+                'intention_ttl': 60,
+            },
+            'members': [],
+            'meta': {},
+            'invites': [],
+            'revision': 0,
+            'epic_party_id': party_id,
+        }
+
+        party = Party(self, stub)
+        invitation = ReceivedPartyInvitation(
+            self,
+            party,
+            self.net_cl,
+            {'sent_by': sender_id, 'sent_at': sent_at},
+        )
+        invitation.epic_party_id = party_id
+        self.dispatch_event('party_invite', invitation)
+
+    async def _handle_epic_join_request(self, payload: dict,
+                                       source: str) -> None:
+        requester_id = (
+            payload.get('requester_id')
+            or payload.get('sent_by')
+            or payload.get('account_id')
+        )
+        if not requester_id:
+            return
+
+        sent_at = payload.get('sent_at') or payload.get('sent')
+        key = f'join:{requester_id}:{sent_at}'
+        now = time.time()
+        seen = self._epic_party_handled_invites.get(key)
+        if seen and now - seen < 60:
+            return
+        self._epic_party_handled_invites[key] = now
+
+        if self.party is None:
+            return
+
+        friend = self.get_friend(requester_id)
+        if friend is None:
+            try:
+                friend = await self.wait_for(
+                    'friend_add',
+                    check=lambda f: f.id == requester_id,
+                    timeout=3,
+                )
+            except asyncio.TimeoutError:
+                return
+
+        sent_at = sent_at or to_iso(
+            datetime.datetime.now(datetime.timezone.utc)
+        )
+        expires_at = payload.get('expires_at') or to_iso(
+            from_iso(sent_at) + datetime.timedelta(seconds=60)
+        )
+
+        request = PartyJoinRequest(
+            self,
+            self.party,
+            friend,
+            {'sent_at': sent_at, 'expires_at': expires_at, 'epic': True},
+        )
+        self.dispatch_event('party_join_request', request)
+
+    async def handle_epic_party_notification(self, event_type: str,
+                                            payload: dict) -> None:
+        prefix = 'party.v2.'
+        if not event_type.startswith(prefix):
+            return
+
+        event = event_type[len(prefix):]
+        party_id = payload.get('party_id') or payload.get('partyId')
+
+        if event == 'MEMBER_EXPIRED_PARTY_DISBANDED':
+            await self.recreate_party_after_epic_disband(
+                'stomp-disbanded', party_id
+            )
+            return
+
+        if 'JOIN_REQUEST' in event or 'INTENTION' in event:
+            if any(x in event for x in ('EXPIRED', 'CANCEL', 'DECLINED')):
+                return
+            await self._handle_epic_join_request(payload, event)
+            return
+
+        try:
+            await self._epic_party_poll()
+        except Exception as e:
+            log.debug(f'notification poll failed: {e}')
 
     def construct_party(self, data: dict, *,
                         cls: Optional[ClientParty] = None) -> ClientParty:
@@ -3626,36 +4273,55 @@ class Client(BasicClient):
             else:
                 cf = self.default_party_config.config
 
-            while True:
+            epic_party_id = None
+            data = None
+            if (not self.disable_epic_party_service
+                    and self.websocket.connection_id is not None
+                    and self.auth.eas_access_token is not None):
                 try:
-                    data = await self.http.party_create(
-                        cf,
-                        priority=priority
+                    data, epic_party_id = await self._create_epic_party(
+                        cf, priority=priority
                     )
-                    break
-                except HTTPException as exc:
-                    if exc.message_code != ('errors.com.epicgames.social.'
-                                            'party.user_has_party'):
-                        raise
-
-                    data = await self.http.party_lookup_user(
-                        self.user.id,
-                        priority=priority
+                except Exception as e:
+                    log.debug(
+                        f'create failed ({e}), falling back '
+                        'to legacy party create'
                     )
+                    data = None
 
+            if data is None:
+                while True:
                     try:
-                        await self.http.party_leave(
-                            data['current'][0]['id'],
+                        data = await self.http.party_create(
+                            cf,
                             priority=priority
                         )
-                    except HTTPException as e:
-                        m = ('errors.com.epicgames.social.'
-                             'party.party_not_found')
-                        if e.message_code != m:
+                        break
+                    except HTTPException as exc:
+                        if exc.message_code != ('errors.com.epicgames.social.'
+                                                'party.user_has_party'):
                             raise
+
+                        data = await self.http.party_lookup_user(
+                            self.user.id,
+                            priority=priority
+                        )
+
+                        try:
+                            await self.http.party_leave(
+                                data['current'][0]['id'],
+                                priority=priority
+                            )
+                        except HTTPException as e:
+                            m = ('errors.com.epicgames.social.'
+                                 'party.party_not_found')
+                            if e.message_code != m:
+                                raise
 
             config = {**cf, **data['config']}
             party = self.construct_party(data)
+            if epic_party_id:
+                party.epic_party_id = epic_party_id
             await party._update_members(
                 members=data['members'],
                 priority=priority
@@ -3790,7 +4456,7 @@ class Client(BasicClient):
 
         return body, signature_string
 
-    async def join_party(self, party_id: str) -> ClientParty:
+    async def join_legacy_party(self, party_id: str) -> ClientParty:
         """|coro|
 
         Joins a party by the party id.

@@ -441,7 +441,7 @@ class Friend(FriendBase):
             The clients new party.
         """
         _pre = self.last_presence
-        if _pre is None:
+        if _pre is None or _pre.party is None:
             raise PartyError('Could not join party. Reason: Party not found')
 
         if _pre.party.private:

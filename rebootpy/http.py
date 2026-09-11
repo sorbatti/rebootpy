@@ -1717,6 +1717,244 @@ class HTTPClient:
                          party_id=party_id)
         return await self.patch(r, json=payload, **kwargs)
 
+    ###################################
+    #           Epic Party            #
+    ###################################
+
+    async def epic_party_create(self, connection_id: str,
+                               **kwargs: Any) -> dict:
+        payload = {
+            'join_info': {
+                'connection': {
+                    'meta': {
+                        'platform': self.client.platform.value,
+                        'game': 'fn',
+                    },
+                    'deployment_id': self.client.deployment_id,
+                    'id': connection_id,
+                },
+            },
+            'config': {
+                'joinability': 'INVITE_ONLY',
+            },
+        }
+        r = ChatService('/epic/party/internal/v2/parties')
+        return await self.post(
+            r,
+            json=payload,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_set_config(self, epic_party_id: str, joinability: str,
+                                   revision: int = 0, **kwargs: Any) -> Any:
+        payload = {
+            'config': {'joinability': joinability},
+            'revision': revision,
+        }
+        r = ChatService(
+            '/epic/party/internal/v2/parties/{epic_party_id}',
+            epic_party_id=epic_party_id
+        )
+        return await self.patch(
+            r,
+            json=payload,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_connect(self, epic_party_id: str, connection_id: str,
+                                **kwargs: Any) -> Any:
+        payload = {
+            'connection_id': connection_id,
+            'yield_leadership': False,
+        }
+        r = ChatService(
+            ('/epic/party/v2/{deployment_id}/parties/{epic_party_id}/'
+             'members/{account_id}/connect'),
+            deployment_id=self.client.deployment_id,
+            epic_party_id=epic_party_id,
+            account_id=self.client.user.id,
+        )
+        return await self.post(
+            r,
+            json=payload,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_join(self, epic_party_id: str, connection_id: str,
+                             **kwargs: Any) -> Any:
+        payload = {
+            'connection': {
+                'meta': {
+                    'platform': self.client.platform.value,
+                    'game': 'fn',
+                },
+                'deployment_id': self.client.deployment_id,
+                'id': connection_id,
+            },
+        }
+        r = ChatService(
+            ('/epic/party/internal/v2/parties/{epic_party_id}/'
+             'members/{account_id}/join'),
+            epic_party_id=epic_party_id,
+            account_id=self.client.user.id,
+        )
+        return await self.post(
+            r,
+            json=payload,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_keep_alive(self, epic_party_id: str,
+                                   **kwargs: Any) -> Any:
+        r = ChatService(
+            ('/epic/party/internal/v2/parties/{epic_party_id}/'
+             'members/{account_id}/keep-alive'),
+            epic_party_id=epic_party_id,
+            account_id=self.client.user.id,
+        )
+        return await self.post(
+            r,
+            json={},
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_leave(self, epic_party_id: str, **kwargs: Any) -> Any:
+        r = ChatService(
+            '/epic/party/internal/v2/parties/{epic_party_id}/members/{account_id}',  # noqa
+            epic_party_id=epic_party_id,
+            account_id=self.client.user.id,
+        )
+        return await self.delete(
+            r,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_remove_member(self, epic_party_id: str,
+                                      account_id: str,
+                                      **kwargs: Any) -> Any:
+        r = ChatService(
+            '/epic/party/internal/v2/parties/{epic_party_id}/members/{account_id}',  # noqa
+            epic_party_id=epic_party_id,
+            account_id=account_id,
+        )
+        return await self.delete(
+            r,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_get_user(self, account_id: Optional[str] = None,
+                                 **kwargs: Any) -> dict:
+        r = ChatService(
+            '/epic/party/internal/v2/users/{account_id}',
+            account_id=account_id or self.client.user.id,
+        )
+        return await self.get(
+            r,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_send_invite(self, friend_id: str,
+                                    **kwargs: Any) -> Any:
+        payload = {
+            'guid': uuid.uuid4().hex.upper(),
+            'SocialMenuContext': 'Profile',
+            'epv': '1',
+        }
+        params = {'auto': 'false', 'platform': '0'}
+        r = ChatService(
+            '/epic/party/internal/v2/users/{friend_id}/invites/{account_id}',
+            friend_id=friend_id,
+            account_id=self.client.user.id,
+        )
+        return await self.post(
+            r,
+            json=payload,
+            params=params,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_decline_join_request(self, requester_id: str,
+                                             **kwargs: Any) -> Any:
+        r = ChatService(
+            ('/epic/party/internal/v2/users/{account_id}/'
+             'joinRequests/{requester_id}'),
+            account_id=self.client.user.id,
+            requester_id=requester_id,
+        )
+        return await self.delete(
+            r,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def party_lobby_join(self, epic_party_id: str, lobby_id: str,
+                               config: dict, **kwargs: Any) -> dict:
+        payload = {
+            'config': config,
+            'join_info': {
+                'connection': {
+                    'id': str(self.client.xmpp.local_jid),
+                    'meta': {
+                        'urn:epic:conn:platform_s': self.client.platform.value
+                    },
+                },
+                'meta': {
+                    'CrossplayPreference_i': '1',
+                    'SubGame_u': '1',
+                    'urn:epic:member:dn_s': self.client.user.display_name,
+                },
+            },
+        }
+        r = PartyService(
+            ('/party/api/v1/Fortnite/epic-parties/{epic_party_id}/lobbies/'
+             '{lobby_id}/members/{account_id}/join'),
+            epic_party_id=epic_party_id,
+            lobby_id=lobby_id,
+            account_id=self.client.user.id,
+        )
+        return await self.post(r, json=payload, **kwargs)
+
+    async def eos_presence_send(self, connection_id: str, payload: dict,
+                                internal: bool = False,
+                                **kwargs: Any) -> Any:
+        if internal:
+            r = ChatService(
+                ('/epic/presence/internal/v1/_/{account_id}/'
+                 'presence/{connection_id}'),
+                account_id=self.client.user.id,
+                connection_id=connection_id,
+            )
+        else:
+            r = ChatService(
+                ('/epic/presence/v1/{deployment_id}/{account_id}/'
+                 'presence/{connection_id}'),
+                deployment_id=self.client.deployment_id,
+                account_id=self.client.user.id,
+                connection_id=connection_id,
+            )
+        return await self.patch(r, json=payload, auth="EAS_ACCESS_TOKEN",
+                                 **kwargs)
+
+    async def matchmaking_request(self, **kwargs: Any) -> Any:
+        payload = {
+            'criteria': [],
+            'openPlayersRequired': 1,
+            'buildUniqueId': '',
+            'maxResults': 1,
+        }
+        r = FortnitePublicService(
+            '/fortnite/api/matchmaking/session/matchMakingRequest'
+        )
+        return await self.post(r, json=payload, **kwargs)
 
     ###################################
     #            Creative             #
@@ -1854,8 +2092,11 @@ class HTTPClient:
                 )}"
 
         r = ChatService(
-            f'/epic/presence/v1/{self.client.deployment_id}/'
-            f'{self.client.user.id}/presence/{connection_id}'
+            '/epic/presence/v1/{deployment_id}/{account_id}/'
+            'presence/{connection_id}',
+            deployment_id=self.client.deployment_id,
+            account_id=self.client.user.id,
+            connection_id=connection_id,
         )
         return await self.patch(r, json=payload, **kwargs)
 
@@ -1970,10 +2211,22 @@ class HTTPClient:
         if self.client.party.member_count == 1:
             raise ChatError("Client is in a party alone.")
 
+        epic_party_id = self.client.party.epic_party_id
+        if epic_party_id:
+            scope = '_'
+            addressed = f'ep-{epic_party_id}'
+            signed_conversation_id = addressed
+            signed_type = "Persistent"
+        else:
+            scope = self.client.deployment_id
+            addressed = f'p-{self.client.party.id}'
+            signed_conversation_id = self.client.party.id
+            signed_type = "Party"
+
         body, signature = self.client.create_signed_message(
-            conversation_id=self.client.party.id,
+            conversation_id=signed_conversation_id,
             content=content,
-            type="Party"
+            type=signed_type
         )
 
         payload = {
@@ -1996,10 +2249,10 @@ class HTTPClient:
         }
 
         r = ChatService(
-            '/epic/chat/v1/public/{deployment_id}/conversations/'
+            '/epic/chat/v1/public/{scope}/conversations/'
             '{conversation_id}/messages?fromAccountId={client_id}',
-            deployment_id=self.client.deployment_id,
-            conversation_id=f'p-{self.client.party.id}',
+            scope=scope,
+            conversation_id=addressed,
             client_id=self.client.user.id
         )
         return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
