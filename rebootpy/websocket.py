@@ -302,7 +302,6 @@ class WebsocketClient:
             asyncio.ensure_future(self.client._epic_party_poll())
 
     async def connect_to_websocket(self) -> None:
-        print('connecting to ws')
         headers = {
             'Authorization': f'Bearer {self.client.auth.eas_access_token}',
             'Epic-Connect-Protocol': 'stomp',
