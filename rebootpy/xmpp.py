@@ -514,7 +514,7 @@ class XMPPClient:
         if 'urn:epic:cfg:build-id_s' not in invite['meta']:
             pres = self.client.get_presence(pinger)
             if (pres is not None and pres.party is not None
-                    and not pres.party.private):
+                    and not pres.party.private and pres.party.net_cl):
                 net_cl = pres.party.net_cl
             else:
                 net_cl = self.client.net_cl
@@ -1285,11 +1285,7 @@ class XMPPClient:
         while self._connected:
             if self.stanza != stanza:
                 await self.xmpp_send(self.stanza)
-                await self.client.http.chat_send_presence(
-                    connection_id=self.client.websocket.connection_id,
-                    auth="EAS_ACCESS_TOKEN",
-                    status=self.status
-                )
+                await self.client.send_eos_presence()
                 stanza = self.stanza
             await asyncio.sleep(1)
 

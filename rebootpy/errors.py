@@ -67,6 +67,13 @@ class XMPPError(FortniteException):
     pass
 
 
+class STOMPError(FortniteException):
+    """This exception is raised when something regarding the STOMP service
+    fails.
+    """
+    pass
+
+
 class PartyError(FortniteException):
     """This exception is raised when something regarding parties fails."""
     pass

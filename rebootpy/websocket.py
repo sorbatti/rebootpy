@@ -31,9 +31,13 @@ import functools
 import logging
 import base64
 import datetime
+import random
+
+from collections import deque
 
 from .message import FriendMessage, PartyMessage
 from .presence import Presence
+from .errors import STOMPError
 
 from aiohttp import hdrs, helpers, client_reqrep, connector
 from aiohttp.http import StreamWriter, HttpVersion10, HttpVersion11
@@ -60,8 +64,15 @@ class WebsocketClient:
         self.ws_task = None
 
         self.heartbeat_started = False
+        self._ready_event = asyncio.Event()
 
         self.connection_id = None
+        self.public_connection_id = None
+        self.private_connection_id = None
+        self._eas_public_sub_id = None
+        self._eas_private_sub_id = None
+
+        self.message_history = deque(maxlen=100)
 
     async def set_session(self) -> None:
         self.wss_session = aiohttp.ClientSession()
@@ -101,23 +112,84 @@ class WebsocketClient:
 
         data = json.loads(raw_json[:-1]) if len(raw_json) >= 3 else {}
 
+        if message_type == 'MESSAGE':
+            message_id = data.get('id')
+            if message_id:
+                if message_id in self.message_history:
+                    return
+                self.message_history.append(message_id)
+
         log.debug(
             f'{datetime.datetime.now(datetime.timezone.utc)} - Received websocket message with type'
             f' {message_type} with the headers {headers} and body \n{data}.')
 
         if message_type == 'CONNECTED' and not self.heartbeat_started:
             self.heartbeat_started = True
+            session_id = headers.get('session', '')
 
             delay = int(headers['heart-beat'].split(',')[1]) // 1000
             self.client.loop.create_task(self.send_heartbeat(delay))
 
-            await self.websocket.send_str(f"SUBSCRIBE\nid:0\n"
-                                          f"destination:launcher\n\n\x00")
+            eas_n = str(random.randint(1, 0xffffffff))
+            self._eas_public_sub_id = f'sub-eas-{eas_n}'
+            self._eas_private_sub_id = f'sub-eas-private-{eas_n}'
+
+            token = self.client.auth.eas_access_token
+            destination = (
+                f'deploymentId/{self.client.deployment_id}/'
+                f'epicAccountId/{self.client.user.id}'
+            )
+            eas_headers = {
+                'authorization': f'Bearer {token}',
+                'ec-coord-accept-language': 'en',
+            }
+
+            sub_public = (
+                'SUBSCRIBE\n'
+                f'id:{self._eas_public_sub_id}\n'
+                f'destination:{destination}\n'
+            )
+            if session_id:
+                sub_public += f'receipt:sub-0-{session_id}\n'
+            for key, value in eas_headers.items():
+                sub_public += f'{key}:{value}\n'
+            await self.websocket.send_str(sub_public + '\n\x00')
+
+            sub_private = (
+                'SUBSCRIBE\n'
+                f'id:{self._eas_private_sub_id}\n'
+                f'destination:{destination}\n'
+                'ec-coord-temporary-subscription:parties-internal\n'
+            )
+            if session_id:
+                sub_private += f'receipt:sub-1-{session_id}\n'
+            for key, value in eas_headers.items():
+                sub_private += f'{key}:{value}\n'
+            await self.websocket.send_str(sub_private + '\n\x00')
         elif (message_type == 'MESSAGE' and 'type' in data
               and data['type'] == 'core.connect.v1.connected'):
             self.connection_id = data['connectionId']
-            await self.send_presence(
-                connection_id=self.connection_id
+
+            if self._eas_public_sub_id:
+                self.public_connection_id = (
+                    f'{self.connection_id}#{self._eas_public_sub_id}'
+                )
+            if self._eas_private_sub_id:
+                self.private_connection_id = (
+                    f'{self.connection_id}#{self._eas_private_sub_id}'
+                )
+
+            await self.client.send_eos_presence()
+            self._ready_event.set()
+        elif (
+            message_type == 'MESSAGE' and
+            isinstance(data.get('type'), str) and
+            data['type'].startswith('party.v2.')
+        ):
+            asyncio.ensure_future(
+                self.client.handle_epic_party_notification(
+                    data['type'], data.get('payload') or {}
+                )
             )
         elif (
             message_type == 'MESSAGE' and
@@ -153,13 +225,34 @@ class WebsocketClient:
         elif (
             message_type == 'MESSAGE' and
             data.get('type') == 'social.chat.v1.NEW_MESSAGE' and
-            data.get('payload').get('conversation').get('type') == 'party'
+            data.get('payload', {}).get('conversation', {}).get('type')
+            in ('party', 'epic_party')
         ):
+            conversation_type = data['payload']['conversation']['type']
+            conversation_id = data['payload']['conversation']['conversationId']  # noqa
             user_id = data['payload']['message']['senderId']
             party = self.client.party
 
-            if (user_id == self.client.user.id
-                    or user_id not in party._members):
+            client_party_id = party.id if party is not None else None
+            if conversation_type == 'epic_party':
+                bare_id = conversation_id[3:] if conversation_id.startswith(
+                    'ep-'
+                ) else conversation_id
+                matches_party = bool(client_party_id) and (
+                    client_party_id.startswith(f'{bare_id}-')
+                )
+            else:
+                bare_id = conversation_id[2:] if conversation_id.startswith(
+                    'p-'
+                ) else conversation_id
+                matches_party = client_party_id == bare_id
+
+            if (
+                party is None
+                or not matches_party
+                or user_id == self.client.user.id
+                or user_id not in party._members
+            ):
                 return
 
             decoded_content = decode_message_body(
@@ -192,14 +285,6 @@ class WebsocketClient:
                 data['payload']
             )
 
-            if _pres.party is not None:
-                try:
-                    display_name = _pres.party.raw['sDN']
-                    if display_name != _pres.friend.display_name:
-                        _pres.friend._update_display_name(display_name)
-                except (KeyError, AttributeError):
-                    pass
-
             before_pres = friend.last_presence
 
             # Check how real client handles this.
@@ -221,9 +306,14 @@ class WebsocketClient:
         ):
             log.debug('STOMP authentication token is now invalid')
             await self.restart()
+        elif (
+            message_type == 'MESSAGE' and
+            isinstance(data.get('type'), str) and
+            ('party' in data['type'].lower() or 'invite' in data['type'].lower())  # noqa
+        ):
+            asyncio.ensure_future(self.client._epic_party_poll())
 
     async def connect_to_websocket(self) -> None:
-        print('connecting to ws')
         headers = {
             'Authorization': f'Bearer {self.client.auth.eas_access_token}',
             'Epic-Connect-Protocol': 'stomp',
@@ -231,13 +321,18 @@ class WebsocketClient:
             'Epic-Connect-Device-Id': " ",
         }
         async with self.wss_session.ws_connect(
-            "wss://connect.epicgames.dev/",
+            "wss://connect.epicgames.dev/v2",
             protocols=['stomp'],
             headers=headers
         ) as websocket:
             self.websocket = websocket
-            connect_frame = f"CONNECT\nheart-beat:30000,0\n" \
-                            f"accept-version:1.0,1.1,1.2\n\n\x00"
+            connect_frame = (
+                "CONNECT\n"
+                "accept-version:1.0,1.1,1.2\n"
+                "heart-beat:30000,0\n"
+                f"authorization:Bearer {self.client.auth.eas_access_token}\n"
+                "\n\x00"
+            )
             await websocket.send_str(connect_frame)
 
             async for msg in websocket:
@@ -245,10 +340,18 @@ class WebsocketClient:
 
     async def run(self) -> None:
         log.debug('Starting STOMP websocket client')
+        self._ready_event.clear()
         await self.set_session()
         self.ws_task = self.client.loop.create_task(
             self.connect_to_websocket()
         )
+
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            raise STOMPError(
+                'Timed out connecting to connect to STOMP'
+            )
 
     async def close(self) -> None:
         log.debug('Closing STOMP websocket client')
@@ -256,6 +359,12 @@ class WebsocketClient:
         await self.wss_session.close()
 
         self.heartbeat_started = False
+        self.connection_id = None
+        self.public_connection_id = None
+        self.private_connection_id = None
+        self._eas_public_sub_id = None
+        self._eas_private_sub_id = None
+        self._ready_event.clear()
 
     async def restart(self) -> None:
         log.debug('Restarting STOMP websocket client')
@@ -270,3 +379,4 @@ class WebsocketClient:
             self.ws_task = None
 
         await self.run()
+        await self.client.rebind_epic_party_connection()

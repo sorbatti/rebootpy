@@ -620,10 +620,84 @@ class PartyMemberMeta(MetaBase):
                     "travelId": "",
                     "playlistVersion": 0,
                     "maxMatchmakingDelay": 0,
+                    "flags": 0,
+                    "priority": 1,
                     "readyStatus": "NotReady",
                     "readyStatusMMId": "",
                     "result": "CanceledMemberError",
                     "stayTogetherHash": 0
+                }
+            }),
+            "Default:MatchmakingData1_j": json.dumps({
+                "MatchmakingData1": {
+                    "groupMemberData": {
+                        "iD": "",
+                        "schemaId": 0,
+                        "barrierBits": 0,
+                        "failReason": "",
+                        "timedOutBarrierIndex": 4294967295,
+                        "worldSessionId": "",
+                        "matchmakingDelay": 0,
+                        "playlistVersion": 0,
+                        "hiddenMatchmakingDelayMax": 0,
+                        "state": 0,
+                        "result": 0
+                    },
+                    "islandSelection": {
+                        "island": json.dumps({
+                            "LinkId": "",
+                            "Session": {
+                                "iD": "",
+                                "joinInfo": {
+                                    "joinability": "CanNotBeJoinedOrWatched",
+                                    "sessionKey": ""
+                                }
+                            },
+                            "MatchmakingSettingsV2": {
+                                "/Fortnite.com/Matchmaking:Region": "EU"
+                            }
+                        }),
+                        "timestamp": 0,
+                        "bUsingGracefulUpgrade": True,
+                        "matchmakingId": ""
+                    },
+                    "priority": 1
+                }
+            }),
+            "Default:MatchmakingData2_j": json.dumps({
+                "MatchmakingData2": {
+                    "groupMemberData": {
+                        "iD": "",
+                        "schemaId": 0,
+                        "barrierBits": 0,
+                        "failReason": "",
+                        "timedOutBarrierIndex": 4294967295,
+                        "worldSessionId": "",
+                        "matchmakingDelay": 0,
+                        "playlistVersion": 0,
+                        "hiddenMatchmakingDelayMax": 0,
+                        "state": 0,
+                        "result": 0
+                    },
+                    "islandSelection": {
+                        "island": json.dumps({
+                            "LinkId": "",
+                            "Session": {
+                                "iD": "",
+                                "joinInfo": {
+                                    "joinability": "CanNotBeJoinedOrWatched",
+                                    "sessionKey": ""
+                                }
+                            },
+                            "MatchmakingSettingsV2": {
+                                "/Fortnite.com/Matchmaking:Region": "EU"
+                            }
+                        }),
+                        "timestamp": 0,
+                        "bUsingGracefulUpgrade": True,
+                        "matchmakingId": ""
+                    },
+                    "priority": 1
                 }
             }),
             "Default:SpectateInfo_j": json.dumps({
@@ -3680,6 +3754,12 @@ class PartyBase:
         self._members = {}
         self._applicants = data.get('applicants', [])
         self._squad_assignments = OrderedDict()
+        self.epic_party_id = data.get('epic_party_id')
+
+        if self.epic_party_id is None and self._id:
+            match = re.match(r'^([0-9a-f]{32})-\d+-default$', self._id, re.IGNORECASE)
+            if match:
+                self.epic_party_id = match.group(1)
 
         self._update_invites(data.get('invites', []))
         self._update_config(data.get('config'))
@@ -3990,8 +4070,13 @@ class Party(PartyBase):
         super().__init__(client, data)
 
     def __repr__(self) -> str:
-        return ('<Party id={0.id!r} leader={0.leader.id!r} '
-                'member_count={0.member_count}>'.format(self))
+        leader = self.leader
+        return ('<Party id={0!r} leader={1!r} '
+                'member_count={2}>'.format(
+                    self.id,
+                    leader.id if leader is not None else None,
+                    self.member_count,
+                ))
 
     async def join(self) -> 'ClientParty':
         """|coro|
@@ -4030,7 +4115,7 @@ class Party(PartyBase):
         if self.client.party.id == self.id:
             raise PartyError('You are already a member of this party.')
 
-        return await self.client.join_party(self.id)
+        return await self.client.join_legacy_party(self.id)
 
 
 class ClientParty(PartyBase, Patchable):
@@ -4481,7 +4566,21 @@ class ClientParty(PartyBase, Patchable):
 
         if len(self._members) == self.max_size:
             raise PartyError('Party is full')
-        
+
+        if self.epic_party_id and self.client.auth.eas_access_token is not None:  # noqa
+            try:
+                await self.client.http.epic_party_send_invite(friend.id)
+            except HTTPException:
+                pass
+            else:
+                return SentPartyInvitation(
+                    self.client,
+                    self,
+                    self.me,
+                    self.client.store_user(friend.get_raw()),
+                    {'sent_at': datetime.datetime.utcnow()}
+                )
+
         invites = await self.fetch_invites()
 
         ping = False
@@ -4587,6 +4686,15 @@ class ClientParty(PartyBase, Patchable):
         me = self.me
         if me is not None:
             me._cancel_clear_emote()
+
+        if self.epic_party_id:
+            try:
+                await self.client.http.epic_party_leave(
+                    self.epic_party_id,
+                    priority=priority
+                )
+            except HTTPException:
+                pass
 
         try:
             await self.client.http.party_leave(
@@ -4791,7 +4899,9 @@ class ReceivedPartyInvitation:
         The UTC time this invite was created at.
     """
 
-    __slots__ = ('client', 'party', 'net_cl', 'sender', 'created_at')
+    __slots__ = (
+        'client', 'party', 'net_cl', 'sender', 'created_at', 'epic_party_id'
+    )
 
     def __init__(self, client: 'Client',
                  party: Party,
@@ -4800,6 +4910,7 @@ class ReceivedPartyInvitation:
         self.client = client
         self.party = party
         self.net_cl = net_cl
+        self.epic_party_id = data.get('epic_party_id') or party.epic_party_id
 
         self.sender = self.client.get_friend(data['sent_by'])
         self.created_at = from_iso(data['sent_at'])
@@ -4838,10 +4949,13 @@ class ReceivedPartyInvitation:
         :class:`ClientParty`
             The party the client joined by accepting the invitation.
         """
+        if self.epic_party_id:
+            return await self.client.join_party(self.epic_party_id)
+
         if self.net_cl != self.client.net_cl and self.client.net_cl != '':
             raise PartyError('Incompatible net_cl')
 
-        party = await self.client.join_party(self.party.id)
+        party = await self.client.join_legacy_party(self.party.id)
         asyncio.ensure_future(
             self.client.http.party_delete_ping(self.sender.id)
         )
@@ -4859,6 +4973,9 @@ class ReceivedPartyInvitation:
         HTTPException
             Something went wrong when declining the invitation.
         """
+        if self.epic_party_id:
+            return
+
         await self.client.http.party_delete_ping(self.sender.id)
 
 
@@ -5069,7 +5186,9 @@ class PartyJoinRequest:
         should always be one minute after its creation.
     """
 
-    __slots__ = ('client', 'party', 'friend', 'created_at', 'expires_at')
+    __slots__ = (
+        'client', 'party', 'friend', 'created_at', 'expires_at', 'is_epic'
+    )
 
     def __init__(self, client: 'Client',
                  party: ClientParty,
@@ -5080,6 +5199,7 @@ class PartyJoinRequest:
         self.friend = friend
         self.created_at = from_iso(data['sent_at'])
         self.expires_at = from_iso(data['expires_at'])
+        self.is_epic = data.get('epic', False)
 
     async def accept(self):
         """|coro|
@@ -5098,3 +5218,20 @@ class PartyJoinRequest:
             An error occurred while requesting.
         """
         return await self.party.invite(self.friend.id)
+
+    async def decline(self) -> None:
+        """|coro|
+
+        Declines the join request.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+        """
+        if not self.is_epic:
+            return
+
+        await self.client.http.epic_party_decline_join_request(
+            self.friend.id
+        )
