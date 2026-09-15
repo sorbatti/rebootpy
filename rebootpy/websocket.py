@@ -280,12 +280,13 @@ class WebsocketClient:
                 except asyncio.TimeoutError:
                     return
 
+            before_pres = friend.last_presence
+
             _pres = Presence(
                 self.client,
-                data['payload']
+                data['payload'],
+                previous=before_pres,
             )
-
-            before_pres = friend.last_presence
 
             # Check how real client handles this.
             # if not is_available and friend.is_online():

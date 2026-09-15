@@ -28,7 +28,7 @@ import re
 import datetime
 import json
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from .errors import Forbidden, PartyError
 from .enums import Platform, AwayStatus
@@ -244,6 +244,8 @@ class Presence:
         The friend's status.
     joinable: :class:`bool`
         Says if friend is joinable.
+    invitable: :class:`bool`
+        Says if the friend can be invited according to EOS presence.
     session_id: :class:`str`
         The friend's current session id. Often referred to as
         server key or game key. Returns ``None`` if the friend is not currently
@@ -281,7 +283,7 @@ class Presence:
     """
 
     __slots__ = ('client', 'raw', 'away', 'friend', 'platform',
-                 'received_at', 'status', 'joinable',
+                 'received_at', 'status', 'joinable', 'invitable',
                  'session_id', 'has_properties', 'homebase_rating', 'lfg',
                  'sub_game', 'in_unjoinable_match', 'playlist', 'party_size',
                  'max_party_size', 'server_player_count',
@@ -290,9 +292,12 @@ class Presence:
     def __init__(
         self,
         client: 'Client',
-        raw: dict
+        raw: dict,
+        previous: Optional['Presence'] = None,
     ) -> None:
         self.client = client
+        if previous is not None and raw.get('status') != 'offline':
+            raw = self._merge_raw(previous.raw, raw)
         self.raw = raw
 
         from_id = raw['accountId']
@@ -302,7 +307,24 @@ class Presence:
         self.away = AwayStatus.AWAY if raw['status'] == 'away' \
             else AwayStatus.ONLINE
 
-        data = (raw.get('perNs') or [{}])[0]
+        per_ns = raw.get('perNs') or [{}]
+        private_data = next(
+            (item for item in per_ns if item.get('ns') == '_'),
+            {},
+        )
+        data = next(
+            (
+                item for item in per_ns
+                if item.get('props')
+                and (
+                    item.get('productId') == 'prod-fn'
+                    or item.get('ns') == self.client.deployment_id
+                    or item.get('props', {}).get('EOS_ProductName')
+                    == 'Fortnite'
+                )
+            ),
+            next((item for item in per_ns if item.get('props')), per_ns[0]),
+        )
 
         self.status = data.get('activity', {}).get('value')
 
@@ -374,13 +396,45 @@ class Presence:
         key = "party.joininfodata.286331153"
         if key not in raw_properties:
             self.party = None
-            self.joinable = None
+            legacy_joinable = None
         else:
             self.party = PresenceParty(
                 self.client,
                 json.loads(raw_properties[key])
             )
-            self.joinable = not self.party.private
+            legacy_joinable = not self.party.private
+
+        eos_party = private_data.get('party') or {}
+        self.joinable = eos_party.get('joinable', legacy_joinable)
+        self.invitable = eos_party.get('invitable')
+
+    @staticmethod
+    def _merge_raw(previous: dict, current: dict) -> dict:
+        merged = {**previous, **current}
+        namespaces = {}
+        order = []
+
+        for index, item in enumerate(previous.get('perNs') or []):
+            key = item.get('ns', f'previous:{index}')
+            namespaces[key] = dict(item)
+            order.append(key)
+
+        for index, item in enumerate(current.get('perNs') or []):
+            key = item.get('ns', f'current:{index}')
+            existing = namespaces.get(key, {})
+            namespace = {**existing, **item}
+            for field in ('activity', 'party', 'props', 'conn'):
+                if field in existing or field in item:
+                    namespace[field] = {
+                        **(existing.get(field) or {}),
+                        **(item.get(field) or {}),
+                    }
+            namespaces[key] = namespace
+            if key not in order:
+                order.append(key)
+
+        merged['perNs'] = [namespaces[key] for key in order]
+        return merged
 
     def __repr__(self) -> str:
         return (
