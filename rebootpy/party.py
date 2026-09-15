@@ -4755,13 +4755,30 @@ class ClientParty(PartyBase, Patchable):
         if not isinstance(privacy, dict):
             privacy = privacy.value
 
+        if self.epic_party_id:
+            joinability = (
+                'INVITE_ONLY'
+                if privacy['partyType'] == 'Private' else 'OPEN'
+            )
+            await self.client.set_epic_party_joinability(
+                self.epic_party_id,
+                joinability,
+            )
+
         updated, deleted, config = self.meta.set_privacy(privacy)
         if not self.edit_lock.locked():
-            return await self.patch(
+            result = await self.patch(
                 updated=updated,
                 deleted=deleted,
                 config=config,
             )
+        else:
+            result = None
+
+        if self.epic_party_id:
+            await self.client.send_eos_presence(party_privacy=privacy)
+
+        return result
 
     async def set_region(self, region: Region) -> None:
         """|coro|

@@ -3300,7 +3300,8 @@ class Client(BasicClient):
             log.debug(f'connection rebind failed: {e}')
             return False
 
-    async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
+    async def send_eos_presence(self, raw_status: Optional[dict] = None,
+                                party_privacy: Optional[dict] = None) -> None:
         connection_id = self.websocket.connection_id
         if not connection_id:
             return
@@ -3328,6 +3329,30 @@ class Client(BasicClient):
         })
         social_status_json = json.dumps({'attendingSocialEventIds': []})
 
+        join_data = {'bIsPrivate': True}
+        if self.party:
+            privacy = party_privacy or self.party.config['privacy']
+            permission = privacy['presencePermission']
+            can_advertise = (
+                permission == 'Anyone'
+                or (
+                    permission == 'Leader'
+                    and self.party.me is not None
+                    and self.party.me.leader
+                )
+            )
+            if can_advertise:
+                join_data = {
+                    'sDN': self.user.display_name,
+                    'sP': self.platform.value,
+                    'p': self.party.id,
+                    'd': 'Fortnite',
+                    'b': self.party_build_id,
+                    'f': 6,
+                    'nAR': 0,
+                    'pc': self.party.member_count,
+                }
+
         payload = {
             'status': 'online',
             'activity': {'value': status_value},
@@ -3341,7 +3366,9 @@ class Client(BasicClient):
                 'FortGameplayStats': f'm{gameplay_stats_json}',
                 'SocialStatus': f'm{social_status_json}',
                 'InUnjoinableMatch': 'bfalse',
-                'party.joininfodata.286331153': 'm{"bIsPrivate":true}',
+                'party.joininfodata.286331153': (
+                    f'm{json.dumps(join_data, separators=(",", ":"))}'
+                ),
                 'EOS_Platform': self.platform.value,
                 'EOS_IntegratedPlatform': 'EGS',
                 'EOS_OnlinePlatformType': '100',
@@ -3360,7 +3387,8 @@ class Client(BasicClient):
             'conn': {'props': {}},
         }
         if epic_party_id:
-            is_private = self.party.config['privacy']['partyType'] == 'Private'  # noqa
+            privacy = party_privacy or self.party.config['privacy']
+            is_private = privacy['partyType'] == 'Private'
             internal_presence['party'] = {
                 'type': 'INVITE_ONLY' if is_private else 'OPEN',
                 'id': epic_party_id,
@@ -3453,12 +3481,23 @@ class Client(BasicClient):
             private_connection_id, priority=priority
         )
 
-        await self.http.epic_party_set_config(
-            epic_party['id'],
-            'OPEN',
-            revision=epic_party.get('revision', 0),
-            priority=priority,
+        privacy = party_config.get('privacy') or {}
+        is_private = privacy.get('partyType') == 'Private'
+        epic_joinability = 'INVITE_ONLY' if is_private else 'OPEN'
+        current_joinability = (epic_party.get('config') or {}).get(
+            'joinability'
         )
+        if current_joinability != epic_joinability:
+            updated_party = await self.http.epic_party_set_config(
+                epic_party['id'],
+                epic_joinability,
+                revision=epic_party.get('revision', 0),
+                priority=priority,
+            )
+            if isinstance(updated_party, dict):
+                epic_party = updated_party
+
+        self._epic_party_revision = int(epic_party.get('revision', 0))
 
         await self.http.epic_party_connect(
             epic_party['id'], public_connection_id, priority=priority
@@ -3468,9 +3507,13 @@ class Client(BasicClient):
         lobby_id = f"{epic_party['id']}-{build_id}-default"
 
         lobby_config = {
-            'discoverability': 'ALL',
+            'discoverability': (
+                'INVITED_ONLY' if is_private else 'ALL'
+            ),
             'join_confirmation': party_config.get('join_confirmation', False),
-            'joinability': 'OPEN',
+            'joinability': (
+                'INVITE_AND_FORMER' if is_private else 'OPEN'
+            ),
             'max_size': party_config.get('max_size', 16),
         }
         lobby = await self.http.party_lobby_join(
@@ -3718,19 +3761,29 @@ class Client(BasicClient):
 
     async def set_epic_party_joinability(self, epic_party_id: str,
                                         joinability: str,
-                                        retried: bool = False) -> None:
+                                        retried: bool = False) -> Any:
         try:
-            await self.http.epic_party_set_config(
+            result = await self.http.epic_party_set_config(
                 epic_party_id, joinability, revision=self._epic_party_revision
             )
-            self._epic_party_revision += 1
         except HTTPException as e:
             code = getattr(e, 'message_code', '') or ''
             if not retried and code.endswith('stale_revision'):
+                state = await self.http.epic_party_get_user()
+                current = state.get('current') or {}
+                if current.get('id') != epic_party_id:
+                    raise
+                self._epic_party_revision = int(current['revision'])
                 return await self.set_epic_party_joinability(
                     epic_party_id, joinability, retried=True
                 )
-            log.debug(f'joinability {joinability} failed: {e}')
+            raise
+
+        if isinstance(result, dict) and result.get('revision') is not None:
+            self._epic_party_revision = int(result['revision'])
+        else:
+            self._epic_party_revision += 1
+        return result
 
     async def _emit_epic_party_invite(self, invite: dict) -> None:
         sender_id = invite.get('sent_by')
@@ -4388,6 +4441,11 @@ class Client(BasicClient):
                 priority=priority,
                 config={**cfg1, **cfg2},
             )
+
+            if epic_party_id:
+                await self.send_eos_presence(
+                    party_privacy=config['privacy']
+                )
 
             return party
 
