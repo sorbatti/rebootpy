@@ -2914,6 +2914,8 @@ class Client(BasicClient):
         self._epic_party_recreate_in_flight = False
         self._epic_party_last_recreate_at = 0.0
 
+        self._chat_message_sequences: Dict[str, int] = {}
+
         self._reconnecting_to_party = False
 
         self.setup_internal()
@@ -4425,18 +4427,27 @@ class Client(BasicClient):
 
         self.public_key_b64 = base64.b64encode(public_key_bytes).decode()
 
+    def next_chat_message_sequence(self, conversation_id: str) -> int:
+        sequence = self._chat_message_sequences.get(conversation_id, 0) + 1
+        self._chat_message_sequences[conversation_id] = sequence
+        return sequence
+
     def create_signed_message(self,
                               conversation_id: str,
                               content: str,
                               type: str = "Persistent",
-                              sequence: int = 1
+                              sequence: int = 1,
+                              eos_party: bool = False
                               ) -> Tuple[str, str]:
         timestamp = int(
             datetime.datetime.now(datetime.timezone.utc).timestamp()
         )
 
         message_info = {
-            "mid": uuid.uuid4().hex,
+            "mid": (
+                uuid.uuid4().hex.upper()
+                if eos_party else uuid.uuid4().hex
+            ),
             "sid": self.user.id,
             "rid": conversation_id,
             "msg": content,
@@ -4447,9 +4458,18 @@ class Client(BasicClient):
             "cty": type
         }
 
-        body = base64.b64encode(
-            json.dumps(message_info).encode()
-        ).decode("utf-8")
+        if eos_party:
+            raw_body = (
+                json.dumps(
+                    message_info,
+                    separators=(",", ":")
+                ).encode("utf-8")
+                + bytes([0])
+            )
+        else:
+            raw_body = json.dumps(message_info).encode()
+
+        body = base64.b64encode(raw_body).decode("utf-8")
         message = body.encode() + bytes([0])
         signature = self.private_key.sign(message)
         signature_string = base64.b64encode(signature).decode()

@@ -2226,8 +2226,25 @@ class HTTPClient:
         body, signature = self.client.create_signed_message(
             conversation_id=signed_conversation_id,
             content=content,
-            type=signed_type
+            type=signed_type,
+            sequence=(
+                self.client.next_chat_message_sequence(
+                    signed_conversation_id
+                )
+                if epic_party_id else 1
+            ),
+            eos_party=bool(epic_party_id),
         )
+
+        metadata = {
+            "TmV": "2",
+            "Pub": self.client.key_data.get("jwt"),
+            "Sig": signature,
+            "PlfNm": self.client.platform.value,
+            "PlfId": self.client.user.id,
+        }
+        if not epic_party_id:
+            metadata["NPM"] = "1"
 
         payload = {
             "allowedRecipients": [
@@ -2238,14 +2255,7 @@ class HTTPClient:
                 "body": body
             },
             "isReportable": False,
-            "metadata": {
-                "TmV": "2",
-                "Pub": self.client.key_data.get("jwt"),
-                "Sig": signature,
-                "NPM": "1",
-                "PlfNm": self.client.platform.value,
-                "PlfId": self.client.user.id,
-            },
+            "metadata": metadata,
         }
 
         r = ChatService(
