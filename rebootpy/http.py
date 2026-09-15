@@ -1898,6 +1898,19 @@ class HTTPClient:
             **kwargs
         )
 
+    async def epic_party_decline_invite(self, inviter_id: str,
+                                       **kwargs: Any) -> Any:
+        r = ChatService(
+            '/epic/party/internal/v2/users/{account_id}/invites/{inviter_id}',
+            account_id=self.client.user.id,
+            inviter_id=inviter_id,
+        )
+        return await self.delete(
+            r,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
     async def epic_party_decline_join_request(self, requester_id: str,
                                              **kwargs: Any) -> Any:
         r = ChatService(

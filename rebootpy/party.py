@@ -4596,18 +4596,15 @@ class ClientParty(PartyBase, Patchable):
             raise PartyError('Party is full')
 
         if self.epic_party_id and self.client.auth.eas_access_token is not None:  # noqa
-            try:
-                await self.client.http.epic_party_send_invite(friend.id)
-            except HTTPException:
-                pass
-            else:
-                return SentPartyInvitation(
-                    self.client,
-                    self,
-                    self.me,
-                    self.client.store_user(friend.get_raw()),
-                    {'sent_at': datetime.datetime.utcnow()}
-                )
+            raw = await self.client.http.epic_party_send_invite(friend.id)
+            self.client._epic_party_sent_invites[friend.id] = raw
+            return SentPartyInvitation(
+                self.client,
+                self,
+                self.me,
+                self.client.store_user(friend.get_raw()),
+                raw,
+            )
 
         invites = await self.fetch_invites()
 
@@ -4690,6 +4687,39 @@ class ClientParty(PartyBase, Patchable):
         """
         if self.client.is_creating_party():
             return []
+
+        if self.epic_party_id:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            active = []
+            for receiver_id, raw in list(
+                self.client._epic_party_sent_invites.items()
+            ):
+                if raw.get('party_id') != self.epic_party_id:
+                    continue
+
+                expires_at = raw.get('expires_at')
+                if expires_at and from_iso(expires_at) <= now:
+                    del self.client._epic_party_sent_invites[receiver_id]
+                    continue
+
+                active.append((receiver_id, raw))
+
+            users = await self.client.fetch_users(
+                (receiver_id for receiver_id, _ in active),
+                cache=True,
+            )
+            users_by_id = {user.id: user for user in users}
+            return [
+                SentPartyInvitation(
+                    self.client,
+                    self,
+                    self.me,
+                    users_by_id[receiver_id],
+                    raw,
+                )
+                for receiver_id, raw in active
+                if receiver_id in users_by_id
+            ]
 
         data = await self.client.http.party_lookup(self.id)
 
@@ -5019,6 +5049,7 @@ class ReceivedPartyInvitation:
             Something went wrong when declining the invitation.
         """
         if self.epic_party_id:
+            await self.client.http.epic_party_decline_invite(self.sender.id)
             return
 
         await self.client.http.party_delete_ping(self.sender.id)
@@ -5041,7 +5072,10 @@ class SentPartyInvitation:
         The UTC time this invite was created at.
     """
 
-    __slots__ = ('client', 'party', 'sender', 'receiver', 'created_at')
+    __slots__ = (
+        'client', 'party', 'sender', 'receiver', 'created_at',
+        'epic_party_id', 'raw'
+    )
 
     def __init__(self, client: 'Client',
                  party: Party,
@@ -5054,6 +5088,8 @@ class SentPartyInvitation:
         self.sender = sender
         self.receiver = receiver
         self.created_at = from_iso(data['sent_at'])
+        self.epic_party_id = data.get('party_id') or party.epic_party_id
+        self.raw = data
 
     def __repr__(self) -> str:
         return ('<SentPartyInvitation party={0.party!r} sender={0.sender!r} '
@@ -5106,12 +5142,19 @@ class SentPartyInvitation:
         if self.client.is_creating_party():
             return
 
-        if self.sender.id == self.party.me.id:
+        if self.sender.id != self.party.me.id:
             raise Forbidden('You can only resend invites sent by the client.')
 
-        await self.client.http.party_send_ping(
-            self.receiver.id
-        )
+        if self.epic_party_id:
+            raw = await self.client.http.epic_party_send_invite(
+                self.receiver.id
+            )
+            self.raw = raw
+            self.created_at = from_iso(raw['sent_at'])
+            self.client._epic_party_sent_invites[self.receiver.id] = raw
+            return
+
+        await self.client.http.party_send_ping(self.receiver.id)
 
 
 class PartyJoinConfirmation:
@@ -5209,12 +5252,6 @@ class PartyJoinConfirmation:
 class PartyJoinRequest:
     """Represents a party join request. These requests are in most cases
     only received when the bots party privacy is set to private.
-
-    .. info::
-
-        There is currently no way to reject a join request. The official
-        fortnite client does this by simply ignoring the request and waiting
-        for it to expire.
 
     Attributes
     ----------

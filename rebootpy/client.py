@@ -2910,6 +2910,7 @@ class Client(BasicClient):
         self._epic_party_poll_in_flight = False
         self._epic_party_seen_invites = set()
         self._epic_party_handled_invites = {}
+        self._epic_party_sent_invites: Dict[str, dict] = {}
         self._epic_party_revision = 0
         self._epic_party_recreate_in_flight = False
         self._epic_party_last_recreate_at = 0.0
