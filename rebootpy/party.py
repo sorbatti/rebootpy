@@ -2354,9 +2354,22 @@ class PartyMember(PartyMemberBase):
         if self.client.user.id == self.id:
             raise PartyError('You can\'t kick yourself')
 
+        epic_party_id = self.party.epic_party_id
+        if epic_party_id:
+            await self.client.http.epic_party_remove_member(
+                epic_party_id,
+                self.id,
+            )
+
         try:
             await self.client.http.party_kick_member(self.party.id, self.id)
         except HTTPException as e:
+            if epic_party_id and e.message_code in (
+                'errors.com.epicgames.social.party.member_not_found',
+                'errors.com.epicgames.social.party.party_not_found',
+            ):
+                return
+
             m = 'errors.com.epicgames.social.party.party_change_forbidden'
             if e.message_code == m:
                 raise Forbidden(
@@ -2388,7 +2401,22 @@ class PartyMember(PartyMemberBase):
         if self.client.user.id == self.id:
             raise PartyError('You are already the leader')
 
-        await self.client.http.party_promote_member(self.party.id, self.id)
+        epic_party_id = self.party.epic_party_id
+        if epic_party_id:
+            await self.client.http.epic_party_promote_member(
+                epic_party_id,
+                self.id,
+            )
+
+        try:
+            await self.client.http.party_promote_member(self.party.id, self.id)
+        except HTTPException as e:
+            if epic_party_id and e.message_code in (
+                'errors.com.epicgames.social.party.member_not_found',
+                'errors.com.epicgames.social.party.party_not_found',
+            ):
+                return
+            raise
 
     async def swap_position(self) -> None:
         """|coro|

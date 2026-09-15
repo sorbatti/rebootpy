@@ -1849,6 +1849,22 @@ class HTTPClient:
             **kwargs
         )
 
+    async def epic_party_promote_member(self, epic_party_id: str,
+                                       account_id: str,
+                                       **kwargs: Any) -> Any:
+        r = ChatService(
+            ('/epic/party/internal/v2/parties/{epic_party_id}/members/'
+             '{account_id}/promote'),
+            epic_party_id=epic_party_id,
+            account_id=account_id,
+        )
+        return await self.post(
+            r,
+            json={},
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
     async def epic_party_get_user(self, account_id: Optional[str] = None,
                                  **kwargs: Any) -> dict:
         r = ChatService(
