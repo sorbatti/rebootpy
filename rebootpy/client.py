@@ -2913,6 +2913,7 @@ class Client(BasicClient):
         self._epic_party_revision = 0
         self._epic_party_recreate_in_flight = False
         self._epic_party_last_recreate_at = 0.0
+        self._epic_party_missing_current_count = 0
 
         self._chat_message_sequences: Dict[str, int] = {}
 
@@ -3088,11 +3089,12 @@ class Client(BasicClient):
             log.debug('Refreshing websocket session')
             await self.websocket.close()
             await self.websocket.run()
-            await self.rebind_epic_party_connection()
+            epic_party_rebound = await self.rebind_epic_party_connection()
 
             await asyncio.sleep(2)
 
-            await self._reconnect_to_party()
+            if not epic_party_rebound:
+                await self._reconnect_to_party()
         except AttributeError:
             pass
         finally:
@@ -3270,17 +3272,17 @@ class Client(BasicClient):
             return connection_id.replace('#sub-eas-private-', '#sub-eas-')
         return connection_id
 
-    async def rebind_epic_party_connection(self) -> None:
+    async def rebind_epic_party_connection(self) -> bool:
         if self.disable_epic_party_service:
-            return
+            return False
 
         epic_party_id = self.party.epic_party_id if self.party else None
         if not epic_party_id:
-            return
+            return False
 
         connection_id = self.websocket.connection_id
         if not connection_id:
-            return
+            return False
 
         public_connection_id = self._get_public_connection_id(
             connection_id
@@ -3293,11 +3295,10 @@ class Client(BasicClient):
             log.debug(
                 'rebound connection after STOMP reconnect'
             )
+            return True
         except HTTPException as e:
             log.debug(f'connection rebind failed: {e}')
-            await self.recreate_party_after_epic_disband(
-                'connection-rebind-failed', epic_party_id
-            )
+            return False
 
     async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
         connection_id = self.websocket.connection_id
@@ -3581,6 +3582,19 @@ class Client(BasicClient):
         if time.time() - self._epic_party_last_recreate_at < 3:
             return
 
+        try:
+            state = await self.http.epic_party_get_user()
+        except HTTPException as e:
+            log.debug(f'recreate verification failed: {e}')
+            return
+
+        if state.get('current'):
+            log.debug(
+                f'skipping party recreation; EOS membership still exists '
+                f'(source={source})'
+            )
+            return
+
         self._epic_party_recreate_in_flight = True
         self._epic_party_last_recreate_at = time.time()
         try:
@@ -3661,6 +3675,9 @@ class Client(BasicClient):
             current = data.get('current') or None
             local_epic_party_id = self.party.epic_party_id if self.party else None  # noqa
 
+            if current:
+                self._epic_party_missing_current_count = 0
+
             if current and current.get('revision') is not None:
                 try:
                     self._epic_party_revision = int(current['revision'])
@@ -3668,9 +3685,14 @@ class Client(BasicClient):
                     pass
 
             if not current and local_epic_party_id:
-                await self.recreate_party_after_epic_disband(
-                    'poll-stale-eos', local_epic_party_id
-                )
+                self._epic_party_missing_current_count += 1
+                if self._epic_party_missing_current_count >= 3:
+                    self._epic_party_missing_current_count = 0
+                    await self.recreate_party_after_epic_disband(
+                        'poll-stale-eos', local_epic_party_id
+                    )
+            elif not local_epic_party_id:
+                self._epic_party_missing_current_count = 0
 
             if self._event_has_destination('party_invite'):
                 for invite in invites:
@@ -4242,6 +4264,21 @@ class Client(BasicClient):
         return friend
 
     async def _reconnect_to_party(self, data: Optional[dict] = None) -> None:
+        epic_party_id = self.party.epic_party_id if self.party else None
+        if epic_party_id and self.auth.eas_access_token is not None:
+            try:
+                epic_user = await self.http.epic_party_get_user()
+            except HTTPException as e:
+                log.debug(f'EOS membership verification failed: {e}')
+                return
+
+            if epic_user.get('current'):
+                log.debug(
+                    'Skipping legacy party reconnect while EOS membership '
+                    'still exists'
+                )
+                return
+
         if data is None:
             data = await self.http.party_lookup_user(
                 self.user.id
@@ -4250,14 +4287,10 @@ class Client(BasicClient):
         if data['current']:
             party_data = data['current'][0]
             async with self._join_party_lock:
-                try:
-                    await self._join_party(
-                        party_data,
-                        event='party_member_reconnect'
-                    )
-                except Exception:
-                    await self._create_party(acquire=False)
-                    raise
+                await self._join_party(
+                    party_data,
+                    event='party_member_reconnect'
+                )
         else:
             await self._create_party()
 
