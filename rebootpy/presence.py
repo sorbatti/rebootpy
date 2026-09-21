@@ -140,6 +140,8 @@ class PresenceParty:
         The platform of the friend.
     id: :class:`str`
         The party's id.
+    epic_party_id: Optional[:class:`str`]
+        The EOS party's id, if it was included in presence.
     party_type_id: :class:`str`
         The party's type id.
     app_id: :class:`str`
@@ -156,8 +158,8 @@ class PresenceParty:
         The party's playercount.
     """
 
-    __slots__ = ('client', 'private', 'platform', 'id', 'party_type_id',
-                 'app_id', 'build_id', 'net_cl', 'party_flags',
+    __slots__ = ('client', 'private', 'platform', 'id', 'epic_party_id',
+                 'party_type_id', 'app_id', 'build_id', 'net_cl', 'party_flags',
                  'not_accepting_reason', 'playercount', 'raw')
 
     def __init__(
@@ -176,6 +178,7 @@ class PresenceParty:
         self.platform = Platform(pl) if pl is not None else None
         self.private = data.get('bIsPrivate', False)
         self.id = data.get('p')
+        self.epic_party_id = data.get('epic_party_id')
         self.app_id = data.get('d')
         self.build_id = data.get('b')
 
@@ -193,6 +196,7 @@ class PresenceParty:
 
     def __repr__(self) -> str:
         return ('<PresenceParty private={0.private} id={0.id!r} '
+                'epic_party_id={0.epic_party_id!r} '
                 'playercount={0.playercount}>'.format(self))
 
     async def join(self) -> 'ClientParty':
@@ -214,13 +218,25 @@ class PresenceParty:
         :class:`ClientParty`
             The party that was just joined.
         """
-        if self.client.party.id == self.id:
+        current = self.client.party
+        if (
+            self.epic_party_id is not None
+            and current.epic_party_id == self.epic_party_id
+        ) or (
+            self.id is not None and current.id == self.id
+        ):
             raise PartyError('You are already a member of this party.')
 
         if self.private:
             raise Forbidden('You cannot join a private party.')
 
-        return await self.client.join_legacy_party(self.id)
+        if self.epic_party_id is not None:
+            return await self.client.join_party(self.epic_party_id)
+
+        if self.id is not None:
+            return await self.client.join_legacy_party(self.id)
+
+        raise PartyError('Party id is not available from presence.')
 
 
 class Presence:
@@ -393,18 +409,20 @@ class Presence:
         else:
             self.gameplay_stats = None
 
+        eos_party = private_data.get('party') or {}
         key = "party.joininfodata.286331153"
         if key not in raw_properties:
             self.party = None
             legacy_joinable = None
         else:
+            party_data = json.loads(raw_properties[key])
+            party_data['epic_party_id'] = eos_party.get('id')
             self.party = PresenceParty(
                 self.client,
-                json.loads(raw_properties[key])
+                party_data,
             )
             legacy_joinable = not self.party.private
 
-        eos_party = private_data.get('party') or {}
         self.joinable = eos_party.get('joinable', legacy_joinable)
         self.invitable = eos_party.get('invitable')
 
