@@ -581,7 +581,13 @@ class XMPPClient:
                 fut = asyncio.ensure_future(party.refresh_squad_assignments())
 
         if fut is not None:
-            await fut
+            try:
+                await fut
+            except Exception as e:
+                log.debug(
+                    'Could not refresh squad assignments after member join: '
+                    f'{e}'
+                )
 
         self.client.dispatch_event('internal_party_member_join', member)
 
@@ -620,10 +626,16 @@ class XMPPClient:
 
         party._remove_member(member.id)
 
-        if party.me and party.me.leader and member.id != party.me.id:
-            await party.refresh_squad_assignments()
-
         self.client.dispatch_event('party_member_leave', member)
+
+        if party.me and party.me.leader and member.id != party.me.id:
+            try:
+                await party.refresh_squad_assignments()
+            except Exception as e:
+                log.debug(
+                    'Could not refresh squad assignments after member leave: '
+                    f'{e}'
+                )
 
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_KICKED')  # noqa
     async def event_party_member_kicked(self, ctx: EventContext) -> None:
@@ -647,15 +659,21 @@ class XMPPClient:
 
         party._remove_member(member.id)
 
+        self.client.dispatch_event('party_member_kick', member)
+
         if party.me and party.me.leader and member.id != party.me.id:
-            await party.refresh_squad_assignments()
+            try:
+                await party.refresh_squad_assignments()
+            except Exception as e:
+                log.debug(
+                    'Could not refresh squad assignments after member kick: '
+                    f'{e}'
+                )
 
         if member.id == self.client.user.id:
             p = await self.client._create_party()
 
             self.client.party = p
-
-        self.client.dispatch_event('party_member_kick', member)
 
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_DISCONNECTED')  # noqa
     async def event_party_member_disconnected(self, ctx: EventContext) -> None:
@@ -677,17 +695,33 @@ class XMPPClient:
         if member is None:
             return
 
-        # Dont continue processing for old connections
-        data = await self.client.http.party_lookup(party.id)
-        for member_data in data['members']:
-            if member_data['account_id'] == user_id:
-                connections = member_data['connections']
-                if len(connections) == 1:
-                    break
+        # Dont continue processing for old connections. If the lookup fails,
+        # the event can still be applied when it matches the connection that
+        # is currently cached for this member.
+        try:
+            data = await self.client.http.party_lookup(party.id)
+        except HTTPException as e:
+            connection = body.get('connection') or {}
+            current_connection = member.connection or {}
+            if (
+                not connection.get('id')
+                or connection.get('id') != current_connection.get('id')
+            ):
+                log.debug(
+                    'Could not validate disconnected party connection: '
+                    f'{e}'
+                )
+                return
+        else:
+            for member_data in data['members']:
+                if member_data['account_id'] == user_id:
+                    connections = member_data['connections']
+                    if len(connections) == 1:
+                        break
 
-                for connection in connections:
-                    if 'disconnected_at' not in connection:
-                        return
+                    for connection in connections:
+                        if 'disconnected_at' not in connection:
+                            return
 
         member._update_connection(body.get('connection'))
         self.client.dispatch_event('party_member_zombie', member)
@@ -714,14 +748,20 @@ class XMPPClient:
 
         party._remove_member(member.id)
 
+        self.client.dispatch_event('party_member_expire', member)
+
         if party.me and party.me.leader and member.id != party.me.id:
-            await party.refresh_squad_assignments()
+            try:
+                await party.refresh_squad_assignments()
+            except Exception as e:
+                log.debug(
+                    'Could not refresh squad assignments after member '
+                    f'expire: {e}'
+                )
 
         if member.id == self.client.user.id:
             p = await self.client._create_party()
             self.client.party = p
-
-        self.client.dispatch_event('party_member_expire', member)
 
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_CONNECTED')  # noqa
     async def event_party_member_connected(self, ctx: EventContext) -> None:
@@ -863,7 +903,13 @@ class XMPPClient:
 
                 yielding = party.me._default_config.yield_leadership
                 if party.me and party.me.leader and not yielding:
-                    await party.refresh_squad_assignments()
+                    try:
+                        await party.refresh_squad_assignments()
+                    except Exception as e:
+                        log.debug(
+                            'Could not refresh squad assignments after '
+                            f'member recovery: {e}'
+                        )
 
         def _getattr(member, key):
             value = getattr(member, key)
@@ -910,9 +956,15 @@ class XMPPClient:
                         new_positions[swap_member_id] = req['startingAbsoluteIdx']  # noqa
 
                     if party.me.leader:
-                        await party.refresh_squad_assignments(
-                            new_positions=new_positions
-                        )
+                        try:
+                            await party.refresh_squad_assignments(
+                                new_positions=new_positions
+                            )
+                        except Exception as e:
+                            log.debug(
+                                'Could not refresh squad assignments after '
+                                f'member update: {e}'
+                            )
 
                     try:
                         self.client.dispatch_event(
