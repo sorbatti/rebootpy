@@ -607,18 +607,14 @@ class XMPPClient:
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_LEFT')  # noqa
     async def event_party_member_left(self, ctx: EventContext) -> None:
         body = ctx.body
+        party = ctx.party
+
+        if party is None or party.id != body.get('party_id'):
+            return
 
         user_id = body.get('account_id')
         if user_id != self.client.user.id:
             await self.client._join_party_lock.wait()
-
-        party = self.client.party
-
-        if party is None:
-            return
-
-        if party.id != body.get('party_id'):
-            return
 
         member = party.get_member(user_id)
         if member is None:

@@ -4183,7 +4183,8 @@ class ClientParty(PartyBase, Patchable):
     def _remove_member(self, user_id: str) -> PartyMember:
         if not isinstance(user_id, str):
             user_id = user_id.id
-        self.update_presence()
+        if self.client.party is self:
+            self.update_presence()
         return self._members.pop(user_id)
 
     def construct_presence(self, text: Optional[str] = None) -> dict:

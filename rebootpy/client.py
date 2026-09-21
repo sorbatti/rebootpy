@@ -3898,6 +3898,24 @@ class Client(BasicClient):
             )
             return
 
+        if event == 'MEMBER_LEFT':
+            party = self.party
+            if party is not None and party.epic_party_id == party_id:
+                member = party.get_member(payload.get('account_id'))
+                if member is not None:
+                    party._remove_member(member.id)
+                    self.dispatch_event('party_member_leave', member)
+
+                    if (party.me and party.me.leader
+                            and member.id != party.me.id):
+                        try:
+                            await party.refresh_squad_assignments()
+                        except Exception as e:
+                            log.debug(
+                                'Could not refresh squad assignments after '
+                                f'EOS member leave: {e}'
+                            )
+
         if 'JOIN_REQUEST' in event or 'INTENTION' in event:
             if any(x in event for x in ('EXPIRED', 'CANCEL', 'DECLINED')):
                 return
