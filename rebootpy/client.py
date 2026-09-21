@@ -3904,6 +3904,39 @@ class Client(BasicClient):
             await self._handle_epic_join_request(payload, event)
             return
 
+        if event == 'PARTY_UPDATED':
+            party = self.party
+            if party is not None and party.epic_party_id == party_id:
+                revision = payload.get('revision')
+                if revision is not None:
+                    try:
+                        self._epic_party_revision = max(
+                            self._epic_party_revision,
+                            int(revision),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+                leader_id = payload.get('party_lead')
+                old_leader = party.leader
+                if leader_id and (
+                    old_leader is None or old_leader.id != leader_id
+                ):
+                    new_leader = party.get_member(leader_id)
+                    if new_leader is None:
+                        log.debug(
+                            'Could not apply EOS party leader update because '
+                            f'member {leader_id!r} is not cached'
+                        )
+                    else:
+                        party._update_roles(new_leader)
+                        party.update_presence()
+                        self.dispatch_event(
+                            'party_member_promote',
+                            old_leader,
+                            new_leader,
+                        )
+
         try:
             await self._epic_party_poll()
         except Exception as e:

@@ -771,6 +771,9 @@ class XMPPClient:
             return
 
         old_leader = party.leader
+        if old_leader is not None and old_leader.id == member.id:
+            return
+
         party._update_roles(member)
 
         party.update_presence()
